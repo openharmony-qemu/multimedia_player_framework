@@ -21,6 +21,7 @@
 #include "directory_ex.h"
 #include "ipc_skeleton.h"
 #include "system_sound_log.h"
+#include "system_tone_player.h"
 #include "tokenid_kit.h"
 
 using namespace std;
@@ -428,6 +429,29 @@ napi_status SystemSoundManagerNapi::DefineClassProperties(napi_env env, napi_val
         Construct, nullptr, sizeof(syssndmgr_prop) / sizeof(syssndmgr_prop[0]), syssndmgr_prop, &ctorObj);
 }
 
+static napi_status RegisterToneHapticsFeature(napi_env env, napi_value exports)
+{
+    const ToneHapticsFeature features[] = {ToneHapticsFeature::STANDARD, ToneHapticsFeature::GENTLE};
+    const char *names[] = {"STANDARD", "GENTLE"};
+    napi_value result = nullptr;
+    napi_status status = napi_create_object(env, &result);
+    if (status != napi_ok) {
+        return status;
+    }
+    for (size_t index = 0; index < sizeof(features) / sizeof(features[0]); ++index) {
+        napi_value member = nullptr;
+        status = napi_create_int32(env, static_cast<int32_t>(features[index]), &member);
+        if (status != napi_ok) {
+            return status;
+        }
+        status = napi_set_named_property(env, result, names[index], member);
+        if (status != napi_ok) {
+            return status;
+        }
+    }
+    return napi_set_named_property(env, exports, "ToneHapticsFeature", result);
+}
+
 napi_status SystemSoundManagerNapi::DefineStaticProperties(napi_env env, napi_value exports)
 {
     napi_property_descriptor static_prop[] = {
@@ -449,7 +473,11 @@ napi_status SystemSoundManagerNapi::DefineStaticProperties(napi_env env, napi_va
         DECLARE_NAPI_PROPERTY("SystemSoundType", CreateSystemSoundTypeObject(env)),
     };
 
-    return napi_define_properties(env, exports, sizeof(static_prop) / sizeof(static_prop[0]), static_prop);
+    napi_status status = napi_define_properties(env, exports, sizeof(static_prop) / sizeof(static_prop[0]), static_prop);
+    if (status != napi_ok) {
+        return status;
+    }
+    return RegisterToneHapticsFeature(env, exports);
 }
 
 napi_value SystemSoundManagerNapi::Init(napi_env env, napi_value exports)

@@ -18,6 +18,8 @@
 
 #include "audio_haptic_player.h"
 #include "audio_haptic_sound.h"
+#include "audio_haptic_playback_session.h"
+#include "audio_haptic_publication_callback.h"
 #include "audio_haptic_vibrator.h"
 
 namespace OHOS {
@@ -56,8 +58,21 @@ public:
     void NotifyErrorEvent(int32_t errCode);
     static void SendHapticPlayerEvent(const int32_t &errorCode, const std::string &strEvent);
     void NotifyFirstFrame(const uint64_t &latency);
+    void PlaybackCreated(const std::shared_ptr<AudioHapticPlaybackSession> &session);
+    void PlaybackFirstFrame(const std::shared_ptr<AudioHapticPlaybackSession> &session, uint64_t latency);
+    void PlaybackEndOfStream(const std::shared_ptr<AudioHapticPlaybackSession> &session, bool isLoop);
+    void PlaybackInterrupt(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+        const AudioStandard::InterruptEvent &event);
+    void PlaybackError(const std::shared_ptr<AudioHapticPlaybackSession> &session, int32_t errorCode);
+    void SetPublicationCallback(const std::shared_ptr<AudioHapticPublicationCallback> &callback);
 
 private:
+    std::shared_ptr<AudioHapticPlayerCallback> GetPlayerCallback();
+    std::shared_ptr<AudioHapticPublicationCallback> GetPublicationCallback();
+    void RetireNormalPlayback(AudioHapticSessionEnd reason);
+    void HandlePlaybackEndOfStream(const std::shared_ptr<AudioHapticPlaybackSession> &session, bool isLoop);
+    void HandlePlaybackInterrupt(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+        const AudioStandard::InterruptEvent &event);
     // func for sound
     void ReleaseSound();
     static void HandleEndOfStreamEventThreadFunc(std::weak_ptr<AudioHapticPlayerImpl> player);
@@ -83,14 +98,17 @@ private:
     HapticSource hapticSource_;
     float volume_ = 1.0f;
     std::atomic<bool> loop_ = false;
-    AudioHapticPlayerState playerState_ = AudioHapticPlayerState::STATE_INVALID;
+    std::atomic<AudioHapticPlayerState> playerState_ = AudioHapticPlayerState::STATE_INVALID;
     std::mutex audioHapticPlayerLock_;
-    HapticsMode hapticsMode_ = HapticsMode::HAPTICS_MODE_INVALID;
+    std::atomic<HapticsMode> hapticsMode_ = HapticsMode::HAPTICS_MODE_INVALID;
     std::atomic<int32_t> audioHapticSyncId_ = 0;
     bool isSupportDSPSync_ = false;
 
     // var for callback
     std::weak_ptr<AudioHapticPlayerCallback> audioHapticPlayerCallback_;
+    std::weak_ptr<AudioHapticPublicationCallback> publicationCallback_; // callbackMutex_
+    std::mutex callbackMutex_;
+    std::shared_ptr<AudioHapticPlaybackSession> normalPlaybackSession_; // waitStartVibrateMutex_
     uint64_t audioLatency_ = 0;
     std::shared_ptr<AudioHapticSoundCallback> soundCallback_ = nullptr;
 
@@ -109,7 +127,7 @@ private:
     std::shared_ptr<AudioHapticSound> audioHapticSound_ = nullptr;
 };
 
-class AudioHapticSoundCallbackImpl : public AudioHapticSoundCallback {
+class AudioHapticSoundCallbackImpl : public AudioHapticSoundCallback, public AudioHapticPlaybackCallback {
 public:
     explicit AudioHapticSoundCallbackImpl(std::shared_ptr<AudioHapticPlayerImpl> audioHapticPlayerImpl);
     virtual ~AudioHapticSoundCallbackImpl() = default;
@@ -117,6 +135,12 @@ public:
     void OnEndOfStream() override;
     void OnError(int32_t errorCode) override;
     void OnFirstFrameWriting(uint64_t latency) override;
+    void OnPlaybackCreated(const std::shared_ptr<AudioHapticPlaybackSession> &session) override;
+    void OnPlaybackFirstFrame(const std::shared_ptr<AudioHapticPlaybackSession> &session, uint64_t latency) override;
+    void OnPlaybackEndOfStream(const std::shared_ptr<AudioHapticPlaybackSession> &session, bool isLoop) override;
+    void OnPlaybackInterrupt(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+        const AudioStandard::InterruptEvent &event) override;
+    void OnPlaybackError(const std::shared_ptr<AudioHapticPlaybackSession> &session, int32_t code) override;
     void OnInterrupt(const AudioStandard::InterruptEvent &interruptEvent) override;
 
 private:

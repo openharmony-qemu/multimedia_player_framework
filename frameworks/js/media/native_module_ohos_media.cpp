@@ -32,7 +32,7 @@ static napi_value Export(napi_env env, napi_value exports)
 {
     MEDIA_LOGD("Export() is called");
 
-    OHOS::Media::MediaEnumNapi::Init(env, exports);
+    CHECK_AND_RETURN_RET(OHOS::Media::MediaEnumNapi::Init(env, exports) != nullptr, nullptr);
 
 #ifdef SUPPORT_PLAYER
     OHOS::Media::AudioPlayerNapi::Init(env, exports);

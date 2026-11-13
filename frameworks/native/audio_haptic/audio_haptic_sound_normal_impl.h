@@ -17,6 +17,7 @@
 #define AUDIO_HAPTIC_SOUND_NORMAL_IMPL_H
 
 #include "audio_haptic_sound.h"
+#include "audio_haptic_playback_session.h"
 #include "player.h"
 
 namespace OHOS {
@@ -38,6 +39,18 @@ public:
     int32_t GetAudioCurrentTime() override;
     int32_t SetAudioHapticSoundCallback(const std::shared_ptr<AudioHapticSoundCallback> &callback) override;
 
+    // Private normal-mode hook, selected through the real latency/factory branch.
+    int32_t SetPlaybackCallback(const std::shared_ptr<AudioHapticPlaybackCallback> &callback);
+    int32_t PrepareForStart();
+    void SetAVPlayerState(const std::shared_ptr<AudioHapticPlaybackSession> &session, AudioHapticPlayerState state);
+    void NotifyPreparedEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session);
+    void NotifyErrorEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session, int32_t errorCode);
+    void NotifyFirstFrameEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session, uint64_t latency);
+    void NotifyInterruptEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+        AudioStandard::InterruptEvent &event);
+    void NotifyEndOfStreamEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session, bool isLoop);
+
+    // Retained implementation entry points for legacy standalone sound callers.
     void SetAVPlayerState(AudioHapticPlayerState playerState);
     void NotifyPreparedEvent();
     void NotifyErrorEvent(int32_t errorCode);
@@ -48,6 +61,11 @@ public:
 private:
     int32_t LoadAVPlayer();
     int32_t ResetAVPlayer();
+    int32_t PrepareForStartInternal();
+    std::shared_ptr<AudioHapticSoundCallback> GetLegacyCallback();
+    int32_t FailPreparation(int32_t errorCode);
+    void ReleaseBackend(AudioHapticSessionEnd reason);
+    bool IsCurrentSession(const std::shared_ptr<AudioHapticPlaybackSession> &session, bool allowError = false) const;
     int32_t ReleaseSoundInternal();
     void ReleaseAVPlayer();
     int32_t OpenAudioSource();
@@ -57,14 +75,24 @@ private:
     bool muteAudio_ = false;
     AudioStandard::StreamUsage streamUsage_ = AudioStandard::STREAM_USAGE_UNKNOWN;
     int32_t rendererFlags_ = 0;
+    uint64_t provenanceGeneration505_ = 0; // Native observation generation; never the DSP sync ID.
     float volume_ = 1.0f;
     bool loop_ = false;
     AudioSource configuredAudioSource_;
+    AudioSource pinnedAudioSource_;
     std::atomic<AudioHapticPlayerState> playerState_ = AudioHapticPlayerState::STATE_NEW;
 
     std::weak_ptr<AudioHapticSoundCallback> audioHapticPlayerCallback_;
 
     std::mutex audioHapticPlayerLock_;
+    // Never call the player/user while holding callbackMutex_ or prepareMutex_.
+    std::mutex callbackMutex_;
+    std::shared_ptr<AudioHapticPlaybackSession> playbackSession_;
+    std::weak_ptr<AudioHapticPlaybackCallback> playbackCallback_;
+    bool isStarting_ = false;
+    bool hasPendingFirstFrame_ = false;
+    uint64_t pendingFirstFrameLatency_ = 0;
+    bool errorAdmitted_ = false;
 
     // var for avplayer
     std::shared_ptr<Media::Player> avPlayer_ = nullptr;
@@ -81,6 +109,8 @@ private:
 class AHSoundNormalCallback : public PlayerCallback {
 public:
     explicit AHSoundNormalCallback(std::shared_ptr<AudioHapticSoundNormalImpl> soundNormalImpl);
+    AHSoundNormalCallback(std::shared_ptr<AudioHapticSoundNormalImpl> soundNormalImpl,
+        std::shared_ptr<AudioHapticPlaybackSession> session);
     virtual ~AHSoundNormalCallback() = default;
 
     // PlayerCallback override
@@ -94,7 +124,9 @@ private:
     void HandleEOSEvent(int32_t extra, const Format &infoBody);
 
     std::weak_ptr<AudioHapticSoundNormalImpl> soundNormalImpl_;
-    AudioHapticPlayerState playerState_ = AudioHapticPlayerState::STATE_NEW;
+    const std::shared_ptr<AudioHapticPlaybackSession> session_;
+    // Retain the private callback layout; each event computes its own local state.
+    const AudioHapticPlayerState playerState_ = AudioHapticPlayerState::STATE_NEW;
 };
 } // namespace Media
 } // namespace OHOS

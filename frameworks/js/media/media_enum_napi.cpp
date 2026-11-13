@@ -630,8 +630,28 @@ napi_value MediaEnumNapi::JsEnumStringInit(napi_env env, napi_value exports)
     return exports;
 }
 
+static napi_value RegisterMetadataFetchResult(napi_env env, napi_value exports)
+{
+    // These public values match both existing metadata server/callback protocols.
+    const JsEnumInt members[] = {
+        { "FETCH_FAILED", 0 },
+        { "FETCH_SUCCEEDED", 1 },
+        { "FETCH_CANCELED", 2 },
+    };
+    napi_value object = nullptr;
+    CHECK_AND_RETURN_RET(napi_create_object(env, &object) == napi_ok, nullptr);
+    for (const auto &member : members) {
+        napi_value value = nullptr;
+        CHECK_AND_RETURN_RET(napi_create_int32(env, member.enumInt, &value) == napi_ok, nullptr);
+        CHECK_AND_RETURN_RET(napi_set_named_property(env, object, member.enumName.data(), value) == napi_ok, nullptr);
+    }
+    CHECK_AND_RETURN_RET(napi_set_named_property(env, exports, "FetchResult", object) == napi_ok, nullptr);
+    return exports;
+}
+
 napi_value MediaEnumNapi::Init(napi_env env, napi_value exports)
 {
+    CHECK_AND_RETURN_RET(RegisterMetadataFetchResult(env, exports) != nullptr, nullptr);
     JsEnumIntInit(env, exports);
     JsEnumStringInit(env, exports);
     return exports;

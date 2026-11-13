@@ -18,6 +18,7 @@
 #define HST_LOG_TAG "HiPlayer"
 
 #include "hiplayer_impl.h"
+#include "qemu_audio_provenance505.h"
 
 #include <chrono>
 #include <shared_mutex>
@@ -120,6 +121,11 @@ static void CopyLongDetail(const std::map<std::string, OHOS::Media::Any>& detail
 
 namespace OHOS {
 namespace Media {
+static void EmitProvenance505(const std::string &row)
+{
+    MEDIA_LOG_I("AUDIO_PROVENANCE505 %{public}s", row.c_str());
+}
+
 using namespace Pipeline;
 class PlayerEventReceiver : public EventReceiver {
 public:
@@ -687,6 +693,10 @@ int32_t HiPlayerImpl::AddSubSource(const std::string &url)
 void HiPlayerImpl::ResetIfSourceExisted()
 {
     FALSE_RETURN(demuxer_ != nullptr);
+    Qap505::Observe([&] {
+        std::atomic_store(&audioSourceProvenance505_, std::make_shared<const std::string>());
+        ApplyAudioSourceProvenance505();
+    });
     MEDIA_LOG_I("Source is existed, reset the relatived objects");
     ReleaseInner();
     {
@@ -1078,6 +1088,7 @@ int32_t HiPlayerImpl::Play()
         return TransStatus(Status::ERROR_INVALID_OPERATION);
     }
     ApplyAudioHapticsSyncId();
+    ApplyAudioSourceProvenance505();
     if (pipelineStates_ == PlayerStates::PLAYER_PLAYBACK_COMPLETE || pipelineStates_ == PlayerStates::PLAYER_STOPPED) {
         isStreaming_ = true;
         ret = ((GetPlayRangeStartTime() > PLAY_RANGE_DEFAULT_VALUE) ?
@@ -1490,6 +1501,7 @@ void HiPlayerImpl::AppendPlaybackStatisticsInfo()
 int32_t HiPlayerImpl::Reset()
 {
     MediaTrace trace("HiPlayerImpl::Reset");
+    std::atomic_store(&audioSourceProvenance505_, std::shared_ptr<const std::string>{});
     AppendPlaybackStatisticsInfo();
     if (pipelineStates_ == PlayerStates::PLAYER_STOPPED) {
         return TransStatus(Status::OK);
@@ -1520,6 +1532,10 @@ int32_t HiPlayerImpl::SeekToCurrentTime(int32_t mSeconds, PlayerSeekMode mode)
 Status HiPlayerImpl::Seek(int64_t mSeconds, PlayerSeekMode mode, bool notifySeekDone, bool isUnFreezeSeek)
 {
     MediaTrace trace("HiPlayerImpl::Seek");
+    Qap505::Observe([&] {
+        std::atomic_store(&audioSourceProvenance505_, std::make_shared<const std::string>());
+        ApplyAudioSourceProvenance505(); // Retire provenance; this is not a source-frame-zero assertion after seek.
+    });
     MEDIA_LOG_I("Seek entered. mSeconds : " PUBLIC_LOG_D64 ", seekMode : " PUBLIC_LOG_D32,
                 mSeconds, static_cast<int32_t>(mode));
 
@@ -1962,6 +1978,16 @@ int32_t HiPlayerImpl::SetLooping(bool loop)
 int32_t HiPlayerImpl::SetParameter(const Format& params)
 {
     MediaTrace trace("HiPlayerImpl::SetParameter");
+    Qap505::Observe([&] {
+        if (params.ContainKey(Qap505::KEY)) {
+            std::string descriptor; Qap505::Source source;
+            if (!params.GetStringValue(Qap505::KEY, descriptor) || !Qap505::Decode(descriptor, source)) {
+                descriptor.clear(); // Leaf observes unknown; ordinary business return remains unchanged.
+            }
+            std::atomic_store(&audioSourceProvenance505_, std::make_shared<const std::string>(descriptor));
+            ApplyAudioSourceProvenance505();
+        }
+    });
     if (params.ContainKey(PlayerKeys::PLAYER_AUDIO_HAPTICS_SYNC_ID)) {
         int32_t syncId = DEFAULT_SYNC_ID;
         params.GetIntValue(PlayerKeys::PLAYER_AUDIO_HAPTICS_SYNC_ID, syncId);
@@ -3480,6 +3506,7 @@ void HiPlayerImpl::HandleCompleteEvent(const Event& event)
     } else {
         audioHapticsSyncId_++;
         ApplyAudioHapticsSyncId();
+    ApplyAudioSourceProvenance505();
     }
     UpdatePlayTotalDuration();
     callbackLooper_.OnInfo(INFO_TYPE_EOS, static_cast<int32_t>(singleLoop_.load()), format);
@@ -4365,6 +4392,13 @@ void HiPlayerImpl::SetAudioRendererParameter()
                 globalMeta->SetData(iter->first, iter->second);
             }
         }
+        Qap505::Observe([&] {
+            auto provenance = std::atomic_load(&audioSourceProvenance505_);
+            std::string previous;
+            if (provenance || globalMeta->GetData(Qap505::KEY, previous)) {
+                globalMeta->SetData(Qap505::KEY, provenance ? *provenance : std::string{});
+            }
+        });
         audioSink_->SetParameter(globalMeta);
     }
 }
@@ -4955,6 +4989,18 @@ int32_t HiPlayerImpl::SetAudioHapticsSyncId(int32_t syncId)
     MEDIA_LOG_I("SetAHapSyncId " PUBLIC_LOG_D32, syncId);
     audioHapticsSyncId_ = syncId;
     return TransStatus(Status::OK);
+}
+
+void HiPlayerImpl::ApplyAudioSourceProvenance505()
+{
+    Qap505::Observe([&] {
+        auto provenance = std::atomic_load(&audioSourceProvenance505_);
+        if (!provenance || !audioSink_) { return; }
+        auto privateMeta = std::make_shared<Meta>();
+        privateMeta->SetData(Qap505::KEY, *provenance);
+        audioSink_->SetParameter(privateMeta);
+        Qap505::EmitForwarded(*provenance, EmitProvenance505);
+    });
 }
 
 void HiPlayerImpl::ApplyAudioHapticsSyncId()

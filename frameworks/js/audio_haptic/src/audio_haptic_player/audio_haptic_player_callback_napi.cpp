@@ -29,6 +29,20 @@ constexpr OHOS::HiviewDFX::HiLogLabel LABEL = {LOG_CORE, LOG_DOMAIN_AUDIO_NAPI, 
 
 namespace OHOS {
 namespace Media {
+// Diagnostic addresses originate at the actual callback and captured Session.
+// Pending events strongly retain Session; historical address reuse is not a JS epoch.
+static void TracePublication(const char *stage, const char *eventName, void *instance,
+    const std::shared_ptr<AudioHapticPlaybackSession> &session, bool loop, bool accepted)
+{
+    MEDIA_LOGI("AHPublication stage=%{public}s event=%{public}s scope=%{public}s callback=%{public}p "
+        "session=%{public}p backend=%{public}p end_observed=%{public}d confirmed=%{public}d "
+        "loop=%{public}d accepted=%{public}d", stage, eventName,
+        session ? "normal" : "legacy-fast-unidentified", instance, session.get(),
+        session ? reinterpret_cast<void *>(session->backendDiagnosticIdentity) : nullptr,
+        session ? static_cast<int32_t>(session->end.load()) : -1,
+        session ? static_cast<int32_t>(session->playConfirmed.load()) : 0, loop, accepted);
+}
+
 AudioHapticPlayerCallbackNapi::AudioHapticPlayerCallbackNapi(napi_env env)
     : env_(env)
 {
@@ -97,6 +111,19 @@ static void NativeInterruptEventToJsObj(const napi_env& env, napi_value& jsObj,
 
 void AudioHapticPlayerCallbackNapi::OnInterrupt(const AudioStandard::InterruptEvent &interruptEvent)
 {
+    QueueInterrupt(nullptr, interruptEvent); // legacy/fast public delivery
+}
+
+void AudioHapticPlayerCallbackNapi::OnSessionInterrupt(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    const AudioStandard::InterruptEvent &interruptEvent)
+{
+    CHECK_AND_RETURN_LOG(session != nullptr, "normal interrupt requires its source Session");
+    QueueInterrupt(session, interruptEvent);
+}
+
+void AudioHapticPlayerCallbackNapi::QueueInterrupt(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    const AudioStandard::InterruptEvent &interruptEvent)
+{
     std::lock_guard<std::mutex> lock(cbMutex_);
     MEDIA_LOGI("OnInterrupt: hintType: %{public}d for js", interruptEvent.hintType);
     CHECK_AND_RETURN_LOG(audioInterruptCb_ != nullptr, "Cannot find the reference of interrupt callback");
@@ -106,6 +133,9 @@ void AudioHapticPlayerCallbackNapi::OnInterrupt(const AudioStandard::InterruptEv
     cb->callback = audioInterruptCb_;
     cb->callbackName = AUDIO_INTERRUPT_CALLBACK_NAME;
     cb->interruptEvent = interruptEvent;
+    cb->playbackSession = session;
+    cb->callbackIdentity = this;
+    TracePublication("queue-attempt", "interrupt", this, session, false, true);
     return OnInterruptJsCallback(cb);
 }
 
@@ -116,6 +146,11 @@ void AudioHapticPlayerCallbackNapi::OnInterruptJsCallback(std::unique_ptr<AudioH
         return;
     }
     AudioHapticPlayerJsCallback *event = jsCb.release();
+    // The JS thread may finish/delete event before napi_send_event returns.
+    // Keep diagnostic snapshots independently of the queued context lifetime.
+    const auto sourceSession = event->playbackSession;
+    void *sourceCallbackIdentity = event->callbackIdentity;
+    const bool sourceLoop = event->loopEOS;
     auto task = [event]() {
         std::shared_ptr<AudioHapticPlayerJsCallback> context(
             static_cast<AudioHapticPlayerJsCallback*>(event),
@@ -123,6 +158,10 @@ void AudioHapticPlayerCallbackNapi::OnInterruptJsCallback(std::unique_ptr<AudioH
                 delete ptr;
         });
         CHECK_AND_RETURN_LOG(event != nullptr, "event is nullptr");
+        const bool accepted = IsAudioHapticPublicationLive(event->playbackSession, false, false);
+        TracePublication(accepted ? "task-admitted" : "task-dropped", "interrupt", event->callbackIdentity,
+            event->playbackSession, false, accepted);
+        CHECK_AND_RETURN_LOG(accepted, "discard retired normal interrupt before JS publication");
         std::string request = event->callbackName;
         napi_env env = event->callback->env_;
         napi_ref callback = event->callback->cb_;
@@ -152,6 +191,8 @@ void AudioHapticPlayerCallbackNapi::OnInterruptJsCallback(std::unique_ptr<AudioH
         napi_close_handle_scope(env, scope);
     };
     auto ret = napi_send_event(env_, task, napi_eprio_high, "audioInterrupt");
+    TracePublication(ret == napi_status::napi_ok ? "enqueue" : "enqueue-failed", "interrupt",
+        sourceCallbackIdentity, sourceSession, sourceLoop, ret == napi_status::napi_ok);
     if (ret != napi_status::napi_ok) {
         MEDIA_LOGE("Failed to SendEvent, ret = %{public}d", ret);
         delete event;
@@ -159,6 +200,19 @@ void AudioHapticPlayerCallbackNapi::OnInterruptJsCallback(std::unique_ptr<AudioH
 }
 
 void AudioHapticPlayerCallbackNapi::OnEndOfStream(void)
+{
+    QueueEndOfStream(nullptr, false); // legacy/fast public delivery
+}
+
+void AudioHapticPlayerCallbackNapi::OnSessionEndOfStream(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    bool isLoop)
+{
+    CHECK_AND_RETURN_LOG(session != nullptr, "normal EOS requires its source Session");
+    QueueEndOfStream(session, isLoop);
+}
+
+void AudioHapticPlayerCallbackNapi::QueueEndOfStream(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    bool isLoop)
 {
     std::lock_guard<std::mutex> lock(cbMutex_);
     MEDIA_LOGI("OnEndOfStream in succeed");
@@ -168,6 +222,10 @@ void AudioHapticPlayerCallbackNapi::OnEndOfStream(void)
     CHECK_AND_RETURN_LOG(cb != nullptr, "No memory");
     cb->callback = endOfStreamCb_;
     cb->callbackName = END_OF_STREAM_CALLBACK_NAME;
+    cb->playbackSession = session;
+    cb->loopEOS = isLoop;
+    cb->callbackIdentity = this;
+    TracePublication("queue-attempt", "eos", this, session, isLoop, true);
     return OnEndOfStreamJsCallback(cb);
 }
 
@@ -183,6 +241,11 @@ void AudioHapticPlayerCallbackNapi::OnEndOfStreamJsCallback(std::unique_ptr<Audi
         return;
     }
     AudioHapticPlayerJsCallback *event = jsCb.release();
+    // The JS thread may finish/delete event before napi_send_event returns.
+    // Keep diagnostic snapshots independently of the queued context lifetime.
+    const auto sourceSession = event->playbackSession;
+    void *sourceCallbackIdentity = event->callbackIdentity;
+    const bool sourceLoop = event->loopEOS;
     auto task = [event]() {
         std::shared_ptr<AudioHapticPlayerJsCallback> context(
             static_cast<AudioHapticPlayerJsCallback*>(event),
@@ -190,6 +253,10 @@ void AudioHapticPlayerCallbackNapi::OnEndOfStreamJsCallback(std::unique_ptr<Audi
                 delete ptr;
         });
         CHECK_AND_RETURN_LOG(event != nullptr, "event is nullptr");
+        const bool accepted = IsAudioHapticPublicationLive(event->playbackSession, true, event->loopEOS);
+        TracePublication(accepted ? "task-admitted" : "task-dropped", "eos", event->callbackIdentity,
+            event->playbackSession, event->loopEOS, accepted);
+        CHECK_AND_RETURN_LOG(accepted, "discard retired normal EOS before JS publication");
         std::string request = event->callbackName;
         napi_env env = event->callback->env_;
         napi_ref callback = event->callback->cb_;
@@ -213,6 +280,8 @@ void AudioHapticPlayerCallbackNapi::OnEndOfStreamJsCallback(std::unique_ptr<Audi
         napi_close_handle_scope(env, scope);
     };
     auto ret = napi_send_event(env_, task, napi_eprio_high, "endOfStream");
+    TracePublication(ret == napi_status::napi_ok ? "enqueue" : "enqueue-failed", "eos",
+        sourceCallbackIdentity, sourceSession, sourceLoop, ret == napi_status::napi_ok);
     if (ret != napi_status::napi_ok) {
         MEDIA_LOGE("Failed to SendEvent, ret = %{public}d", ret);
         delete event;

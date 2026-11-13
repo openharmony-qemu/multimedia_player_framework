@@ -22,11 +22,12 @@
 
 #include "audio_haptic_log.h"
 #include "audio_haptic_player.h"
+#include "audio_haptic_publication_callback.h"
 #include "audio_haptic_common_napi.h"
 
 namespace OHOS {
 namespace Media {
-class AudioHapticPlayerCallbackNapi : public AudioHapticPlayerCallback {
+class AudioHapticPlayerCallbackNapi : public AudioHapticPlayerCallback, public AudioHapticPublicationCallback {
 public:
     explicit AudioHapticPlayerCallbackNapi(napi_env env);
     ~AudioHapticPlayerCallbackNapi();
@@ -35,13 +36,22 @@ public:
     void OnInterrupt(const AudioStandard::InterruptEvent &interruptEvent) override;
     void OnEndOfStream(void) override;
     void OnError(int32_t errorCode) override;
+    void OnSessionEndOfStream(const std::shared_ptr<AudioHapticPlaybackSession> &session, bool isLoop) override;
+    void OnSessionInterrupt(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+        const AudioStandard::InterruptEvent &interruptEvent) override;
 private:
     struct AudioHapticPlayerJsCallback {
         std::shared_ptr<AutoRef> callback = nullptr;
         std::string callbackName = "unknown";
+        std::shared_ptr<AudioHapticPlaybackSession> playbackSession;
+        bool loopEOS = false;
+        void *callbackIdentity = nullptr;
         AudioStandard::InterruptEvent interruptEvent;
     };
 
+    void QueueInterrupt(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+        const AudioStandard::InterruptEvent &interruptEvent);
+    void QueueEndOfStream(const std::shared_ptr<AudioHapticPlaybackSession> &session, bool isLoop);
     void OnInterruptJsCallback(std::unique_ptr<AudioHapticPlayerJsCallback> &jsCb);
     void OnEndOfStreamJsCallback(std::unique_ptr<AudioHapticPlayerJsCallback> &jsCb);
 

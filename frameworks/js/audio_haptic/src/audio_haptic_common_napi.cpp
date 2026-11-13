@@ -54,9 +54,10 @@ void AudioHapticCommonNapi::PromiseReject(napi_env env, napi_deferred deferred,
     napi_value error = nullptr;
     napi_value message = nullptr;
     napi_value code = nullptr;
-    napi_create_string_utf8(env, (std::to_string(errCode)).c_str(), NAPI_AUTO_LENGTH, &code);
+    napi_create_int32(env, errCode, &code);
     napi_create_string_utf8(env, errMessage.c_str(), NAPI_AUTO_LENGTH, &message);
-    napi_create_error(env, code, message, &error);
+    napi_create_error(env, nullptr, message, &error);
+    napi_set_named_property(env, error, "code", code);
     napi_reject_deferred(env, deferred, error);
 }
 
@@ -126,6 +127,13 @@ bool AudioHapticCommonNapi::InitPromiseFunc(napi_env env, napi_callback_info inf
     return true;
 }
 
+bool AudioHapticCommonNapi::VerifyVibratePermission()
+{
+    const auto token = static_cast<Security::AccessToken::AccessTokenID>(IPCSkeleton::GetSelfTokenID());
+    return token != 0 && Security::AccessToken::AccessTokenKit::VerifyAccessToken(token,
+        "ohos.permission.VIBRATE") == Security::AccessToken::PERMISSION_GRANTED;
+}
+
 bool AudioHapticCommonNapi::VerifySelfSystemPermission()
 {
     Security::AccessToken::FullTokenID selfTokenID = IPCSkeleton::GetSelfTokenID();
@@ -136,6 +144,9 @@ std::string AudioHapticCommonNapi::GetMessageByCode(int32_t &code)
 {
     std::string errMessage;
     switch (code) {
+        case NAPI_ERR_VIBRATE_PERMISSION_DENIED:
+            errMessage = "Permission denied: ohos.permission.VIBRATE";
+            break;
         case NAPI_ERR_INPUT_INVALID:
             errMessage = NAPI_ERR_INPUT_INVALID_INFO;
             break;

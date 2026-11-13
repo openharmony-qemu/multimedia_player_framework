@@ -695,7 +695,15 @@ napi_value AudioHapticManagerNapi::CreatePlayer(napi_env env, napi_callback_info
             return result;
         }
     }
+    // The public SDK contract requires VIBRATE at createPlayer, including a
+    // muted player. Query the real current process token before native creation
+    // or preload; never rely on a later asynchronous vibrator-service failure.
     napi_create_promise(env, &asyncContext->deferred, &result);
+    if (!AudioHapticCommonNapi::VerifyVibratePermission()) {
+        AudioHapticCommonNapi::PromiseReject(env, asyncContext->deferred, NAPI_ERR_VIBRATE_PERMISSION_DENIED);
+        return result;
+    }
+
 
     napi_create_string_utf8(env, "CreatePlayer", NAPI_AUTO_LENGTH, &resource);
     status = napi_create_async_work(env, nullptr, resource, AsyncCreatePlayer,
@@ -752,6 +760,10 @@ void AudioHapticManagerNapi::CreatePlayerAsyncCallbackComp(napi_env env, napi_st
             napi_create_string_utf8(env, "CreatePlayer Error: Operation is not supported or failed",
                 NAPI_AUTO_LENGTH, &message);
             napi_create_error(env, nullptr, message, &result[PARAM0]);
+            napi_value code = nullptr;
+            napi_create_int32(env, NAPI_ERR_OPERATE_NOT_ALLOWED, &code);
+            napi_set_named_property(env, result[PARAM0], "code", code);
+            context->status = ERROR;
             napi_get_undefined(env, &result[PARAM1]);
         } else {
             napi_get_undefined(env, &result[PARAM0]);

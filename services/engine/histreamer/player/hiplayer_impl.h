@@ -373,6 +373,7 @@ private:
     void ResetEnableCameraPostProcess();
     int32_t SetAudioHapticsSyncId(int32_t syncId);
     void ApplyAudioHapticsSyncId();
+    void ApplyAudioSourceProvenance505();
     void DoInitDemuxer();
     void ReleaseVideoDecoderOnMuted();
     void CacheBuffer();
@@ -510,6 +511,7 @@ private:
     int64_t maxSeekLatency_ = 0;
     int64_t maxAccurateSeekLatency_ = 0;
     uint64_t instanceId_ = 0;
+    std::shared_ptr<const std::string> audioSourceProvenance505_;
     int32_t apiVersion_ = 0;
     int64_t maxSurfaceSwapLatency_ = 0;
     int64_t playTotalDuration_ = 0;

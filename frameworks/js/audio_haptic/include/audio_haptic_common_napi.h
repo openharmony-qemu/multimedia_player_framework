@@ -23,6 +23,7 @@
 
 namespace OHOS {
 namespace Media {
+const int32_t  NAPI_ERR_VIBRATE_PERMISSION_DENIED = 201;
 const int32_t  NAPI_ERR_INPUT_INVALID = 401;
 const int32_t  NAPI_ERR_OPERATE_NOT_ALLOWED = 5400102;
 const int32_t  NAPI_ERR_IO_ERROR = 5400103;
@@ -64,6 +65,7 @@ public:
     static bool InitPromiseFunc(napi_env env, napi_callback_info info,
         AsyncContext* asyncContext, napi_value* promise, size_t paramLength);
     static bool VerifySelfSystemPermission();
+    static bool VerifyVibratePermission();
     static bool InitNormalFunc(napi_env env, napi_callback_info info,
         void **native, napi_value *argv, size_t paramLength);
 };

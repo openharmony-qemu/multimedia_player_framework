@@ -14,6 +14,7 @@
  */
 
 #include "audio_haptic_player_napi.h"
+#include "audio_haptic_player_impl.h"
 
 #include "audio_haptic_log.h"
 
@@ -95,6 +96,13 @@ napi_value AudioHapticPlayerNapi::Constructor(napi_env env, napi_callback_info i
                 obj->callbackNapi_ = std::make_shared<AudioHapticPlayerCallbackNapi>(env);
                 CHECK_AND_RETURN_RET_LOG(obj->callbackNapi_ != nullptr, result, "No memory");
                 int32_t ret = obj->audioHapticPlayer_->SetAudioHapticPlayerCallback(obj->callbackNapi_);
+                // The actual AudioHapticPlayerFactory constructs AudioHapticPlayerImpl
+                // for both latency branches. No RTTI or public-vtable extension.
+                std::static_pointer_cast<AudioHapticPlayerImpl>(obj->audioHapticPlayer_)->
+                    SetPublicationCallback(obj->callbackNapi_);
+                MEDIA_LOGI("AHPublication stage=napi-bind wrapper=%{public}p player=%{public}p callback=%{public}p",
+                    obj.get(), std::static_pointer_cast<AudioHapticPlayerImpl>(obj->audioHapticPlayer_).get(),
+                    obj->callbackNapi_.get());
                 MEDIA_LOGI("Constructor: SetAudioHapticPlayerCallback %{public}s",
                     ret == 0 ? "succeess" : "failed");
             }
@@ -385,16 +393,27 @@ void AudioHapticPlayerNapi::CommonAsyncCallbackComp(napi_env env, napi_status st
     napi_value result[2] = {};
 
     napi_get_undefined(env, &result[PARAM1]);
-    if (!context->status) {
+    if (context->status == MSERR_OK) {
         napi_get_undefined(env, &result[PARAM0]);
     } else {
+        // Preserve the actual native failure as the standard public numeric
+        // BusinessError, including invalid-operation after Release.
+        int32_t errorCode = NAPI_ERR_OPERATE_NOT_ALLOWED;
+        if (context->status == MSERR_OPEN_FILE_FAILED) { errorCode = NAPI_ERR_IO_ERROR; }
+        else if (context->status == MSERR_SERVICE_DIED) { errorCode = NAPI_ERR_SERVICE_DIED; }
+        else if (context->status == MSERR_UNSUPPORT_FILE) { errorCode = NAPI_ERR_UNSUPPORTED_FORMAT; }
         napi_value message = nullptr;
-        napi_create_string_utf8(env, "Error: Operation is not supported or failed", NAPI_AUTO_LENGTH, &message);
+        napi_value code = nullptr;
+        int32_t messageCode = errorCode;
+        const std::string errorMessage = AudioHapticCommonNapi::GetMessageByCode(messageCode);
+        napi_create_string_utf8(env, errorMessage.c_str(), NAPI_AUTO_LENGTH, &message);
         napi_create_error(env, nullptr, message, &result[PARAM0]);
+        napi_create_int32(env, errorCode, &code);
+        napi_set_named_property(env, result[PARAM0], "code", code);
     }
 
     if (context->deferred) {
-        if (!context->status) {
+        if (context->status == MSERR_OK) {
             napi_resolve_deferred(env, context->deferred, result[PARAM1]);
         } else {
             napi_reject_deferred(env, context->deferred, result[PARAM0]);

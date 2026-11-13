@@ -15,8 +15,10 @@
 
 #include "audio_haptic_player_impl.h"
 #include "audio_haptic_sound_normal_impl.h"
+#include "qemu_audio_provenance505.h"
 
 #include <fcntl.h>
+#include <utility>
 
 #include "audio_haptic_log.h"
 #include "directory_ex.h"
@@ -29,6 +31,11 @@ constexpr OHOS::HiviewDFX::HiLogLabel LABEL = {LOG_CORE, LOG_DOMAIN_AUDIO_NAPI, 
 
 namespace OHOS {
 namespace Media {
+static void EmitProvenance505(const std::string &row)
+{
+    MEDIA_LOGI("AUDIO_PROVENANCE505 %{public}s", row.c_str());
+}
+
 const int32_t LOAD_WAIT_SECONDS = 2;
 
 AudioHapticSoundNormalImpl::AudioHapticSoundNormalImpl(const AudioSource& audioSource, const bool &muteAudio,
@@ -42,114 +49,117 @@ AudioHapticSoundNormalImpl::AudioHapticSoundNormalImpl(const AudioSource& audioS
 
 AudioHapticSoundNormalImpl::~AudioHapticSoundNormalImpl()
 {
-    if (avPlayer_ != nullptr) {
-        (void)ReleaseSoundInternal();
-    }
+    // A failed replacement may leave only the independently pinned source FD.
+    (void)ReleaseSoundInternal();
 }
 
 int32_t AudioHapticSoundNormalImpl::LoadAVPlayer()
 {
-    avPlayer_ = PlayerFactory::CreatePlayer();
-    CHECK_AND_RETURN_RET_LOG(avPlayer_ != nullptr, MSERR_INVALID_VAL, "Failed to create AvPlayer instance");
-
-    avPlayerCallback_ = std::make_shared<AHSoundNormalCallback>(shared_from_this());
-    CHECK_AND_RETURN_RET_LOG(avPlayerCallback_ != nullptr, MSERR_INVALID_VAL, "Failed to create callback object");
-    avPlayer_->SetPlayerCallback(avPlayerCallback_);
-
+    auto backend = PlayerFactory::CreatePlayer();
+    CHECK_AND_RETURN_RET_LOG(backend != nullptr, MSERR_INVALID_VAL, "Failed to create AvPlayer instance");
+    auto session = std::make_shared<AudioHapticPlaybackSession>(backend);
+    auto callback = std::make_shared<AHSoundNormalCallback>(shared_from_this(), session);
+    int32_t ret = backend->SetPlayerCallback(callback); // Exactly once on this fresh IDLE backend.
+    if (ret != MSERR_OK) {
+        session->end.store(AudioHapticSessionEnd::PREPARE_FAILED);
+        (void)backend->Release();
+        return ret;
+    }
+    std::shared_ptr<AudioHapticPlaybackCallback> target;
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        playbackSession_ = session;
+        isStarting_ = false;
+        hasPendingFirstFrame_ = false;
+        pendingFirstFrameLatency_ = 0;
+        errorAdmitted_ = false;
+        target = playbackCallback_.lock();
+    }
+    avPlayer_ = backend;
+    avPlayerCallback_ = callback;
     configuredAudioSource_ = {};
     playerState_ = AudioHapticPlayerState::STATE_NEW;
+    if (target != nullptr) { target->OnPlaybackCreated(session); }
     return MSERR_OK;
 }
 
 int32_t AudioHapticSoundNormalImpl::PrepareSound()
 {
-    MEDIA_LOGI("PrepareSound with AVPlayer");
     std::lock_guard<std::mutex> lock(audioHapticPlayerLock_);
-    int32_t result = LoadAVPlayer();
-    CHECK_AND_RETURN_RET_LOG(result == MSERR_OK && avPlayer_ != nullptr, MSERR_INVALID_VAL,
-        "Audio haptic player(avplayer) instance is null");
-    CHECK_AND_RETURN_RET_LOG(!audioSource_.empty(), MSERR_OPEN_FILE_FAILED, "The audio source is empty");
-    if (audioSource_ != configuredAudioSource_) {
-        return ResetAVPlayer();
+    {
+        std::lock_guard<std::mutex> lockPrepare(prepareMutex_);
+        CHECK_AND_RETURN_RET_LOG(!isReleased_, MSERR_INVALID_OPERATION, "The avplayer has been released.");
     }
-    return MSERR_OK;
+    CHECK_AND_RETURN_RET_LOG(!audioSource_.empty(), MSERR_OPEN_FILE_FAILED, "The audio source is empty");
+    return ResetAVPlayer();
 }
 
 int32_t AudioHapticSoundNormalImpl::OpenAudioSource()
 {
-    if (fileDes_ != -1) {
-        (void)close(fileDes_);
-        fileDes_ = -1;
-    }
-
-    auto audioUri = audioSource_.audioUri;
-    auto audioFd = audioSource_.fd;
-    MEDIA_LOGI("Set audio source to avplayer. audioUri [%{public}s] audioFd: [%{public}d]",
-        audioUri.c_str(), audioFd);
+    if (fileDes_ >= 0 && !(audioSource_ != pinnedAudioSource_)) { return MSERR_OK; }
+    const auto audioUri = audioSource_.audioUri;
+    const auto audioFd = audioSource_.fd;
     CHECK_AND_RETURN_RET_LOG(!audioUri.empty() || audioFd > FILE_DESCRIPTOR_INVALID, MSERR_OPEN_FILE_FAILED,
         "The audio uri is empty or the fd is invalid");
-
+    int32_t pinnedFd = -1;
     if (!audioUri.empty()) {
         int32_t oldFd = ExtractFd(audioUri);
         if (oldFd != FILE_DESCRIPTOR_INVALID) {
-            fileDes_ = dup(oldFd);
+            pinnedFd = dup(oldFd);
         } else {
             std::string absFilePath;
             CHECK_AND_RETURN_RET_LOG(PathToRealPath(audioUri, absFilePath), MSERR_OPEN_FILE_FAILED,
                 "file is not real path, file path: %{private}s", audioUri.c_str());
-            CHECK_AND_RETURN_RET_LOG(!absFilePath.empty(), MSERR_OPEN_FILE_FAILED,
-                "Failed to obtain the canonical path for source path %{public}d %{private}s",
-                errno, audioUri.c_str());
-            fileDes_ = open(absFilePath.c_str(), O_RDONLY | O_CLOEXEC);
+            CHECK_AND_RETURN_RET_LOG(!absFilePath.empty(), MSERR_OPEN_FILE_FAILED, "Empty canonical source path");
+            pinnedFd = open(absFilePath.c_str(), O_RDONLY | O_CLOEXEC);
         }
     } else {
-        fileDes_ = dup(audioFd);
+        pinnedFd = dup(audioFd);
     }
-    MEDIA_LOGI("fileDes_ == %{public}d", fileDes_);
-    CHECK_AND_RETURN_RET_LOG(fileDes_ > FILE_DESCRIPTOR_INVALID, MSERR_OPEN_FILE_FAILED,
+    CHECK_AND_RETURN_RET_LOG(pinnedFd > FILE_DESCRIPTOR_INVALID, MSERR_OPEN_FILE_FAILED,
         "Prepare: Invalid fileDes for avplayer.");
+    if (fileDes_ >= 0) { (void)close(fileDes_); }
+    fileDes_ = pinnedFd;
+    pinnedAudioSource_ = audioSource_; // Includes the original offset/length, not a later caller-FD lookup.
     return MSERR_OK;
 }
 
 int32_t AudioHapticSoundNormalImpl::ResetAVPlayer()
 {
-    // Reset the player and reload it.
-    MEDIA_LOGI("ResetAVPlayer");
-    (void)avPlayer_->Reset();
-    int32_t ret = OpenAudioSource();
-    CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, ret, "Failed to open audio source.");
-
-    if (fileDes_ < 0) {
-        MEDIA_LOGE("File opening failed, fileDes_ = %{public}d", fileDes_);
+    // A real fresh backend has no old Play callbacks and must not Reset(IDLE).
+    ReleaseBackend(AudioHapticSessionEnd::REPLACED);
+    {
+        std::lock_guard<std::mutex> lockPrepare(prepareMutex_);
+        CHECK_AND_RETURN_RET_LOG(!isReleased_, MSERR_INVALID_OPERATION, "The avplayer has been released.");
+        isPrepared_ = false;
+        isUnsupportedFile_ = false;
     }
-    ret = avPlayer_->SetSource(fileDes_, audioSource_.offset, audioSource_.length);
-    CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, MSERR_OPEN_FILE_FAILED, "Set source failed %{public}d", ret);
-
+    int32_t ret = LoadAVPlayer();
+    CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, ret, "Failed to create independent AVPlayer");
+    ret = OpenAudioSource();
+    if (ret != MSERR_OK) { return FailPreparation(ret); }
+    ret = avPlayer_->SetSource(fileDes_, pinnedAudioSource_.offset, pinnedAudioSource_.length);
+    if (ret != MSERR_OK) { return FailPreparation(MSERR_OPEN_FILE_FAILED); }
     Format format;
     format.PutIntValue(PlayerKeys::CONTENT_TYPE, AudioStandard::CONTENT_TYPE_UNKNOWN);
     format.PutIntValue(PlayerKeys::STREAM_USAGE, streamUsage_);
-    if (rendererFlags_ != 0) {
-        format.PutIntValue(PlayerKeys::RENDERER_FLAG, rendererFlags_);
-    }
+    if (rendererFlags_ != 0) { format.PutIntValue(PlayerKeys::RENDERER_FLAG, rendererFlags_); }
     ret = avPlayer_->SetParameter(format);
-    CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, ret, "Set stream usage to AVPlayer failed %{public}d", ret);
-
+    if (ret != MSERR_OK) { return FailPreparation(ret); }
     ret = avPlayer_->PrepareAsync();
-    CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, ret, "Prepare failed %{public}d", ret);
-
-    std::unique_lock<std::mutex> lockPrepare(prepareMutex_);
-    prepareCond_.wait_for(lockPrepare, std::chrono::seconds(LOAD_WAIT_SECONDS),
-        [this]() { return isPrepared_ || isReleased_ || isUnsupportedFile_; });
-    CHECK_AND_RETURN_RET_LOG(!isReleased_, MSERR_INVALID_OPERATION, "The avplayer is released when it is preparing.");
-    CHECK_AND_RETURN_RET_LOG(!isUnsupportedFile_, MSERR_UNSUPPORT_FILE, "Unsupported file when preparing avplayer.");
-    CHECK_AND_RETURN_RET_LOG(isPrepared_, MSERR_OPEN_FILE_FAILED, "Failed to load audio uri: time out.");
-
-    // The avplayer has been prepared.
+    if (ret != MSERR_OK) { return FailPreparation(ret); }
+    {
+        std::unique_lock<std::mutex> lockPrepare(prepareMutex_);
+        prepareCond_.wait_for(lockPrepare, std::chrono::seconds(LOAD_WAIT_SECONDS),
+            [this]() { return isPrepared_ || isReleased_ || isUnsupportedFile_; });
+        if (isReleased_) { ret = MSERR_INVALID_OPERATION; }
+        else if (isUnsupportedFile_) { ret = MSERR_UNSUPPORT_FILE; }
+        else if (!isPrepared_) { ret = MSERR_OPEN_FILE_FAILED; }
+    }
+    if (ret != MSERR_OK) { return FailPreparation(ret); }
     float actualVolume = volume_ * (muteAudio_ ? 0 : 1);
-    MEDIA_LOGI("AVPlayer has been prepared. Set volume %{public}f and loop %{public}d.", actualVolume, loop_);
     (void)avPlayer_->SetVolume(actualVolume, actualVolume);
     (void)avPlayer_->SetLooping(loop_);
-
     configuredAudioSource_ = audioSource_;
     playerState_ = AudioHapticPlayerState::STATE_PREPARED;
     return MSERR_OK;
@@ -158,37 +168,54 @@ int32_t AudioHapticSoundNormalImpl::ResetAVPlayer()
 
 int32_t AudioHapticSoundNormalImpl::StartSound(const int32_t &audioHapticSyncId)
 {
-    MEDIA_LOGI("StartSound with AVPlayer");
-    std::lock_guard<std::mutex> lock(audioHapticPlayerLock_);
-    CHECK_AND_RETURN_RET_LOG(avPlayer_ != nullptr && playerState_ != AudioHapticPlayerState::STATE_INVALID,
-        MSERR_INVALID_VAL, "StartAVPlayer: no available AVPlayer_");
-    CHECK_AND_RETURN_RET_LOG(!audioSource_.empty(), MSERR_OPEN_FILE_FAILED, "The audio source is invalid");
-
-    if (playerState_ == AudioHapticPlayerState::STATE_RUNNING) {
-        MEDIA_LOGE("The avplayer has been running. Cannot start again");
-        AudioHapticPlayerImpl::SendHapticPlayerEvent(MSERR_START_FAILED, "AVPLAYER_STATE_RUNNING");
-        return MSERR_START_FAILED;
-    }
-
-    int32_t ret = MSERR_OK;
-    // Player doesn't support play in stopped state. Hence reinitialise player for making start<-->stop to work
-    if (playerState_ == AudioHapticPlayerState::STATE_STOPPED || audioSource_ != configuredAudioSource_) {
-        ret = ResetAVPlayer();
-        CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, ret, "ResetAVPlayer failed %{public}d", ret);
-    }
-
+    std::unique_lock<std::mutex> lock(audioHapticPlayerLock_);
+    int32_t ret = PrepareForStartInternal();
+    CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, ret, "Prepare independent playback failed");
     audioHapticSyncId_ = audioHapticSyncId;
-    MEDIA_LOGI("AudioHapticSoundNormalImpl::StartSound start sound with syncId %{public}d", audioHapticSyncId_);
     Format format;
     format.PutIntValue(PlayerKeys::PLAYER_AUDIO_HAPTICS_SYNC_ID, audioHapticSyncId_);
+    Qap505::Observe([&] {
+        const auto source = Qap505::Probe(fileDes_, pinnedAudioSource_.offset, pinnedAudioSource_.length);
+        provenanceGeneration505_ = source.generation;
+        Qap505::EmitSource(source, EmitProvenance505);
+        (void)format.PutStringValue(Qap505::KEY, Qap505::Encode(source));
+    });
     ret = avPlayer_->SetParameter(format);
-    CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, ret, "Set stream usage to AVPlayer failed %{public}d", ret);
-
+    if (ret != MSERR_OK) {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        playbackSession_->end.store(AudioHapticSessionEnd::START_FAILED);
+        return ret;
+    }
+    std::shared_ptr<AudioHapticPlaybackSession> session;
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        session = playbackSession_;
+        CHECK_AND_RETURN_RET_LOG(IsCurrentSession(session), MSERR_START_FAILED, "Playback was retired before Play");
+        session->playIssued.store(true);
+        isStarting_ = true;
+        hasPendingFirstFrame_ = false;
+    }
     ret = avPlayer_->Play();
+    Qap505::EmitLifecycle("source_play_result", provenanceGeneration505_, ret, EmitProvenance505);
     AudioHapticPlayerImpl::SendHapticPlayerEvent(ret, "AVPLAYER_START_FAILED");
+    bool pending = false;
+    uint64_t latency = 0;
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        isStarting_ = false;
+        session->playConfirmed.store(ret == MSERR_OK);
+        if (ret != MSERR_OK) { session->end.store(AudioHapticSessionEnd::START_FAILED); }
+        pending = ret == MSERR_OK && IsCurrentSession(session) && hasPendingFirstFrame_;
+        latency = pendingFirstFrameLatency_;
+        hasPendingFirstFrame_ = false;
+    }
     CHECK_AND_RETURN_RET_LOG(ret == MSERR_OK, MSERR_START_FAILED, "Start failed %{public}d", ret);
-
-    playerState_ = AudioHapticPlayerState::STATE_RUNNING;
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        if (IsCurrentSession(session)) { playerState_ = AudioHapticPlayerState::STATE_RUNNING; }
+    }
+    lock.unlock();
+    if (pending) { NotifyFirstFrameEvent(session, latency); }
     return MSERR_OK;
 }
 
@@ -199,6 +226,11 @@ int32_t AudioHapticSoundNormalImpl::StopSound()
     CHECK_AND_RETURN_RET_LOG(avPlayer_ != nullptr && playerState_ != AudioHapticPlayerState::STATE_INVALID,
         MSERR_INVALID_VAL, "StopAVPlayer: no available AVPlayer_");
 
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        if (playbackSession_ != nullptr) { playbackSession_->end.store(AudioHapticSessionEnd::STOPPED); }
+        hasPendingFirstFrame_ = false;
+    }
     if (playerState_ != AudioHapticPlayerState::STATE_STOPPED) {
         (void)avPlayer_->Stop();
     }
@@ -231,15 +263,9 @@ int32_t AudioHapticSoundNormalImpl::ReleaseSoundInternal()
 
 void AudioHapticSoundNormalImpl::ReleaseAVPlayer()
 {
-    if (avPlayer_ != nullptr) {
-        (void)avPlayer_->Release();
-        avPlayer_ = nullptr;
-    }
-    avPlayerCallback_ = nullptr;
-    if (fileDes_ != -1) {
-        (void)close(fileDes_);
-        fileDes_ = -1;
-    }
+    ReleaseBackend(AudioHapticSessionEnd::RELEASED);
+    if (fileDes_ >= 0) { (void)close(fileDes_); fileDes_ = -1; }
+    pinnedAudioSource_ = {};
 }
 
 int32_t AudioHapticSoundNormalImpl::SetVolume(float volume)
@@ -284,12 +310,19 @@ int32_t AudioHapticSoundNormalImpl::SetLoop(bool loop)
 
 int32_t AudioHapticSoundNormalImpl::GetAudioCurrentTime()
 {
-    if (avPlayer_ == nullptr) {
-        MEDIA_LOGE("GetAudioCurrentTime: avPlayer_ is nullptr. This function is only usable for avPlayer.");
+    std::shared_ptr<Player> backend;
+    {
+        // The vibration worker may hold its wait mutex here. Do not take the
+        // normal API mutex: LoadAVPlayer announces a session in the opposite direction.
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        if (playbackSession_ != nullptr) { backend = playbackSession_->backend.lock(); }
+    }
+    if (backend == nullptr) {
+        MEDIA_LOGE("GetAudioCurrentTime: no current AVPlayer backend");
         return -1;
     }
     int32_t currentTime = -1;
-    (void)avPlayer_->GetCurrentTime(currentTime);
+    (void)backend->GetCurrentTime(currentTime);
     return currentTime;
 }
 
@@ -302,8 +335,209 @@ int32_t AudioHapticSoundNormalImpl::SetAudioHapticSoundCallback(
     }
 
     std::lock_guard<std::mutex> lock(audioHapticPlayerLock_);
+    std::lock_guard<std::mutex> lockCallback(callbackMutex_);
     audioHapticPlayerCallback_ = callback;
     return MSERR_OK;
+}
+
+std::shared_ptr<AudioHapticSoundCallback> AudioHapticSoundNormalImpl::GetLegacyCallback()
+{
+    std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+    return audioHapticPlayerCallback_.lock();
+}
+
+int32_t AudioHapticSoundNormalImpl::SetPlaybackCallback(const std::shared_ptr<AudioHapticPlaybackCallback> &callback)
+{
+    CHECK_AND_RETURN_RET_LOG(callback != nullptr, MSERR_INVALID_VAL, "Null private playback callback");
+    std::lock_guard<std::mutex> lock(audioHapticPlayerLock_);
+    std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+    CHECK_AND_RETURN_RET_LOG(playbackSession_ == nullptr, MSERR_INVALID_OPERATION, "Do not rebind a live backend");
+    playbackCallback_ = callback;
+    return MSERR_OK;
+}
+
+bool AudioHapticSoundNormalImpl::IsCurrentSession(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    bool allowError) const
+{
+    // Caller holds callbackMutex_. Identity originates at the real backend creation.
+    return session != nullptr && playbackSession_ == session &&
+        (session->end.load() == AudioHapticSessionEnd::LIVE ||
+            (allowError && (session->end.load() == AudioHapticSessionEnd::ERROR ||
+                (session->end.load() == AudioHapticSessionEnd::INTERRUPTED && !session->playIssued.load()))));
+}
+
+void AudioHapticSoundNormalImpl::ReleaseBackend(AudioHapticSessionEnd reason)
+{
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        if (playbackSession_ != nullptr) { playbackSession_->end.store(reason); }
+        playbackSession_.reset();
+        isStarting_ = false;
+        hasPendingFirstFrame_ = false;
+    }
+    if (avPlayer_ != nullptr) { (void)avPlayer_->Release(); avPlayer_.reset(); }
+    avPlayerCallback_.reset();
+    configuredAudioSource_ = {};
+}
+
+int32_t AudioHapticSoundNormalImpl::FailPreparation(int32_t errorCode)
+{
+    std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+    if (playbackSession_ != nullptr) { playbackSession_->end.store(AudioHapticSessionEnd::PREPARE_FAILED); }
+    hasPendingFirstFrame_ = false;
+    return errorCode;
+}
+
+int32_t AudioHapticSoundNormalImpl::PrepareForStart()
+{
+    std::lock_guard<std::mutex> lock(audioHapticPlayerLock_);
+    return PrepareForStartInternal();
+}
+
+int32_t AudioHapticSoundNormalImpl::PrepareForStartInternal()
+{
+    {
+        std::lock_guard<std::mutex> lockPrepare(prepareMutex_);
+        CHECK_AND_RETURN_RET_LOG(!isReleased_, MSERR_INVALID_OPERATION, "The avplayer has been released.");
+    }
+    CHECK_AND_RETURN_RET_LOG(!audioSource_.empty(), MSERR_OPEN_FILE_FAILED, "The audio source is invalid");
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        if (playerState_ == AudioHapticPlayerState::STATE_RUNNING && IsCurrentSession(playbackSession_)) {
+            return MSERR_START_FAILED;
+        }
+    }
+    bool keepPrepared = false;
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        keepPrepared = avPlayer_ != nullptr && IsCurrentSession(playbackSession_) &&
+            !playbackSession_->playIssued.load() && playerState_ == AudioHapticPlayerState::STATE_PREPARED &&
+            !(audioSource_ != configuredAudioSource_);
+    }
+    return keepPrepared ? MSERR_OK : ResetAVPlayer();
+}
+
+void AudioHapticSoundNormalImpl::SetAVPlayerState(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    AudioHapticPlayerState state)
+{
+    std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+    bool interruptedPrepare = session != nullptr && playbackSession_ == session && !session->playIssued.load() &&
+        session->end.load() == AudioHapticSessionEnd::INTERRUPTED && state == AudioHapticPlayerState::STATE_PREPARED;
+    CHECK_AND_RETURN_LOG(IsCurrentSession(session) || interruptedPrepare, "Stale backend state event");
+    if (state == AudioHapticPlayerState::STATE_INVALID) {
+        auto expected = AudioHapticSessionEnd::LIVE;
+        CHECK_AND_RETURN_LOG(session->end.compare_exchange_strong(expected, AudioHapticSessionEnd::ERROR),
+            "Do not overwrite explicit retirement with a late state error");
+    }
+    playerState_ = state;
+}
+
+void AudioHapticSoundNormalImpl::NotifyPreparedEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session)
+{
+    std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+    bool interruptedPrepare = session != nullptr && playbackSession_ == session && !session->playIssued.load() &&
+        session->end.load() == AudioHapticSessionEnd::INTERRUPTED;
+    CHECK_AND_RETURN_LOG(IsCurrentSession(session) || interruptedPrepare, "Stale backend prepared event");
+    std::lock_guard<std::mutex> lockPrepare(prepareMutex_);
+    if (!isReleased_) { isPrepared_ = true; prepareCond_.notify_one(); }
+}
+
+void AudioHapticSoundNormalImpl::NotifyErrorEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    int32_t errorCode)
+{
+    std::shared_ptr<AudioHapticPlaybackCallback> target;
+    std::shared_ptr<AudioHapticSoundCallback> legacy;
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        CHECK_AND_RETURN_LOG(IsCurrentSession(session, true) && !errorAdmitted_, "Stale or duplicate backend error");
+        auto expected = session->end.load();
+        CHECK_AND_RETURN_LOG(expected == AudioHapticSessionEnd::LIVE || expected == AudioHapticSessionEnd::ERROR ||
+            (expected == AudioHapticSessionEnd::INTERRUPTED && !session->playIssued.load()),
+            "Explicit retirement won before error admission");
+        if (expected != AudioHapticSessionEnd::ERROR) {
+            CHECK_AND_RETURN_LOG(session->end.compare_exchange_strong(expected, AudioHapticSessionEnd::ERROR),
+                "Do not overwrite explicit retirement with a late error");
+        }
+        errorAdmitted_ = true;
+        hasPendingFirstFrame_ = false;
+        target = playbackCallback_.lock();
+        if (target == nullptr) { legacy = audioHapticPlayerCallback_.lock(); }
+    }
+    // Admission snapshots a real error before waking Prepare; the private target
+    // queues user notification and never waits for/reenters the API thread here.
+    if (target != nullptr) { target->OnPlaybackError(session, errorCode); }
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        if (playbackSession_ != session) { return; }
+        if (static_cast<MediaServiceErrCode>(errorCode) == MSERR_UNSUPPORT_FILE) {
+            std::lock_guard<std::mutex> lockPrepare(prepareMutex_);
+            isUnsupportedFile_ = true;
+            prepareCond_.notify_one();
+        }
+    }
+    if (legacy != nullptr) { legacy->OnError(errorCode); }
+}
+
+void AudioHapticSoundNormalImpl::NotifyFirstFrameEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    uint64_t latency)
+{
+    std::shared_ptr<AudioHapticPlaybackCallback> target;
+    std::shared_ptr<AudioHapticSoundCallback> legacy;
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        CHECK_AND_RETURN_LOG(IsCurrentSession(session) && session->playIssued.load(), "Stale/nonplaying backend first frame");
+        if (isStarting_) {
+            pendingFirstFrameLatency_ = latency;
+            hasPendingFirstFrame_ = true;
+            return;
+        }
+        CHECK_AND_RETURN_LOG(session->playConfirmed.load(), "Unconfirmed Play first frame");
+        target = playbackCallback_.lock();
+        if (target == nullptr) { legacy = audioHapticPlayerCallback_.lock(); }
+    }
+    if (target != nullptr) { target->OnPlaybackFirstFrame(session, latency); }
+    else if (legacy != nullptr) { legacy->OnFirstFrameWriting(latency); }
+}
+
+void AudioHapticSoundNormalImpl::NotifyInterruptEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    AudioStandard::InterruptEvent &event)
+{
+    std::shared_ptr<AudioHapticPlaybackCallback> target;
+    std::shared_ptr<AudioHapticSoundCallback> legacy;
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        CHECK_AND_RETURN_LOG(IsCurrentSession(session), "Stale backend interrupt");
+        auto expected = AudioHapticSessionEnd::LIVE;
+        CHECK_AND_RETURN_LOG(session->end.compare_exchange_strong(expected, AudioHapticSessionEnd::INTERRUPTED),
+            "Do not overwrite explicit retirement with a late interrupt");
+        hasPendingFirstFrame_ = false;
+        target = playbackCallback_.lock();
+        if (target == nullptr) { legacy = audioHapticPlayerCallback_.lock(); }
+    }
+    if (target != nullptr) { target->OnPlaybackInterrupt(session, event); }
+    else if (legacy != nullptr) { legacy->OnInterrupt(event); }
+}
+
+void AudioHapticSoundNormalImpl::NotifyEndOfStreamEvent(const std::shared_ptr<AudioHapticPlaybackSession> &session,
+    bool isLoop)
+{
+    std::shared_ptr<AudioHapticPlaybackCallback> target;
+    std::shared_ptr<AudioHapticSoundCallback> legacy;
+    {
+        std::lock_guard<std::mutex> lockCallback(callbackMutex_);
+        CHECK_AND_RETURN_LOG(IsCurrentSession(session) && session->playIssued.load(), "Stale/nonplaying backend EOS");
+        if (!isLoop) {
+            auto expected = AudioHapticSessionEnd::LIVE;
+            CHECK_AND_RETURN_LOG(session->end.compare_exchange_strong(expected, AudioHapticSessionEnd::ENDED),
+                "Do not overwrite explicit retirement with a late EOS");
+            playerState_ = AudioHapticPlayerState::STATE_STOPPED;
+            hasPendingFirstFrame_ = false;
+        }
+        target = playbackCallback_.lock();
+        if (target == nullptr) { legacy = audioHapticPlayerCallback_.lock(); }
+    }
+    if (target != nullptr) { target->OnPlaybackEndOfStream(session, isLoop); }
+    else if (legacy != nullptr) { legacy->OnEndOfStream(); }
 }
 
 void AudioHapticSoundNormalImpl::SetAVPlayerState(AudioHapticPlayerState playerState)
@@ -328,7 +562,7 @@ void AudioHapticSoundNormalImpl::NotifyErrorEvent(int32_t errorCode)
         prepareCond_.notify_one();
     }
 
-    std::shared_ptr<AudioHapticSoundCallback> cb = audioHapticPlayerCallback_.lock();
+    auto cb = GetLegacyCallback();
     if (cb != nullptr) {
         MEDIA_LOGI("NotifyFirstFrameEvent for audio haptic player");
         cb->OnError(errorCode);
@@ -339,7 +573,7 @@ void AudioHapticSoundNormalImpl::NotifyErrorEvent(int32_t errorCode)
 
 void AudioHapticSoundNormalImpl::NotifyFirstFrameEvent(uint64_t latency)
 {
-    std::shared_ptr<AudioHapticSoundCallback> cb = audioHapticPlayerCallback_.lock();
+    auto cb = GetLegacyCallback();
     if (cb != nullptr) {
         MEDIA_LOGI("NotifyFirstFrameEvent for audio haptic player");
         cb->OnFirstFrameWriting(latency);
@@ -350,7 +584,7 @@ void AudioHapticSoundNormalImpl::NotifyFirstFrameEvent(uint64_t latency)
 
 void AudioHapticSoundNormalImpl::NotifyInterruptEvent(AudioStandard::InterruptEvent &interruptEvent)
 {
-    std::shared_ptr<AudioHapticSoundCallback> cb = audioHapticPlayerCallback_.lock();
+    auto cb = GetLegacyCallback();
     if (cb != nullptr) {
         MEDIA_LOGI("NotifyInterruptEvent for audio haptic player");
         cb->OnInterrupt(interruptEvent);
@@ -365,7 +599,7 @@ void AudioHapticSoundNormalImpl::NotifyEndOfStreamEvent(const bool &isLoop)
     if (!isLoop) {
         playerState_ = AudioHapticPlayerState::STATE_STOPPED;
     }
-    std::shared_ptr<AudioHapticSoundCallback> cb = audioHapticPlayerCallback_.lock();
+    auto cb = GetLegacyCallback();
     if (cb != nullptr) {
         MEDIA_LOGI("NotifyEndOfStreamEvent for audio haptic player");
         cb->OnEndOfStream();
@@ -396,21 +630,27 @@ int32_t AudioHapticSoundNormalImpl::ExtractFd(const std::string& audioUri)
 
 // Callback class symbols
 AHSoundNormalCallback::AHSoundNormalCallback(std::shared_ptr<AudioHapticSoundNormalImpl> soundNormalImpl)
-    : soundNormalImpl_(soundNormalImpl) {}
+    : soundNormalImpl_(soundNormalImpl), session_(nullptr) {}
+
+AHSoundNormalCallback::AHSoundNormalCallback(std::shared_ptr<AudioHapticSoundNormalImpl> soundNormalImpl,
+    std::shared_ptr<AudioHapticPlaybackSession> session)
+    : soundNormalImpl_(soundNormalImpl), session_(std::move(session)) {}
 
 void AHSoundNormalCallback::OnError(int32_t errorCode, const std::string &errorMsg)
 {
+    CHECK_AND_RETURN_LOG(session_ != nullptr, "Unbound AVPlayer callback");
     MEDIA_LOGE("OnError reported from AVPlayer: %{public}d", errorCode);
     std::shared_ptr<AudioHapticSoundNormalImpl> soundNormalImpl = soundNormalImpl_.lock();
     if (soundNormalImpl == nullptr) {
         MEDIA_LOGE("The audio haptic player for normal mode has been released.");
         return;
     }
-    soundNormalImpl->NotifyErrorEvent(errorCode);
+    soundNormalImpl->NotifyErrorEvent(session_, errorCode);
 }
 
 void AHSoundNormalCallback::OnInfo(Media::PlayerOnInfoType type, int32_t extra, const Media::Format &infoBody)
 {
+    CHECK_AND_RETURN_LOG(session_ != nullptr, "Unbound AVPlayer callback");
     if (type == INFO_TYPE_STATE_CHANGE) {
         MEDIA_LOGI("OnInfo: state change reported from AVPlayer.");
         HandleStateChangeEvent(extra, infoBody);
@@ -431,40 +671,41 @@ void AHSoundNormalCallback::HandleStateChangeEvent(int32_t extra, const Format &
 {
     MEDIA_LOGI("HandleStateChangeEvent from AVPlayer");
     PlayerStates avPlayerState = static_cast<PlayerStates>(extra);
+    AudioHapticPlayerState eventState = playerState_; // Immutable initial value, never another event's state.
     switch (avPlayerState) {
         case PLAYER_STATE_ERROR:
-            playerState_ = AudioHapticPlayerState::STATE_INVALID;
+            eventState = AudioHapticPlayerState::STATE_INVALID;
             break;
         case PLAYER_IDLE:
         case PLAYER_INITIALIZED:
         case PLAYER_PREPARING:
-            playerState_ = AudioHapticPlayerState::STATE_NEW;
+            eventState = AudioHapticPlayerState::STATE_NEW;
             break;
         case PLAYER_PREPARED:
-            playerState_ = AudioHapticPlayerState::STATE_PREPARED;
+            eventState = AudioHapticPlayerState::STATE_PREPARED;
             break;
         case PLAYER_STARTED:
-            playerState_ = AudioHapticPlayerState::STATE_RUNNING;
+            eventState = AudioHapticPlayerState::STATE_RUNNING;
             break;
         case PLAYER_PAUSED:
-            playerState_ = AudioHapticPlayerState::STATE_PAUSED;
+            eventState = AudioHapticPlayerState::STATE_PAUSED;
             break;
         case PLAYER_STOPPED:
         case PLAYER_PLAYBACK_COMPLETE:
-            playerState_ = AudioHapticPlayerState::STATE_STOPPED;
+            eventState = AudioHapticPlayerState::STATE_STOPPED;
             break;
         default:
-            break;
+            return; // No state mapping: do not replay another callback's transition.
     }
     std::shared_ptr<AudioHapticSoundNormalImpl> soundNormalImpl = soundNormalImpl_.lock();
     if (soundNormalImpl == nullptr) {
         MEDIA_LOGE("The audio haptic player for normal mode has been released.");
         return;
     }
-    soundNormalImpl->SetAVPlayerState(playerState_);
+    soundNormalImpl->SetAVPlayerState(session_, eventState);
 
     if (avPlayerState == PLAYER_PREPARED) {
-        soundNormalImpl->NotifyPreparedEvent();
+        soundNormalImpl->NotifyPreparedEvent(session_);
     }
 }
 
@@ -487,13 +728,14 @@ void AHSoundNormalCallback::HandleAudioInterruptEvent(int32_t extra, const Forma
         MEDIA_LOGE("The audio haptic player for normal mode has been released.");
         return;
     }
-    soundNormalImpl->NotifyInterruptEvent(interruptEvent);
+    soundNormalImpl->NotifyInterruptEvent(session_, interruptEvent);
 }
 
 void AHSoundNormalCallback::HandleAudioFirstFrameEvent(int32_t extra, const Format &infoBody)
 {
     int64_t value = 0;
-    (void)infoBody.GetLongValue(PlayerKeys::AUDIO_FIRST_FRAME, value);
+    CHECK_AND_RETURN_LOG(infoBody.GetLongValue(PlayerKeys::AUDIO_FIRST_FRAME, value) && value >= 0,
+        "Invalid audio first frame latency");
     uint64_t latency = static_cast<uint64_t>(value);
     MEDIA_LOGI("HandleAudioFirstFrameEvent from AVPlayer. Latency %{public}" PRIu64 "", latency);
     std::shared_ptr<AudioHapticSoundNormalImpl> soundNormalImpl = soundNormalImpl_.lock();
@@ -501,7 +743,7 @@ void AHSoundNormalCallback::HandleAudioFirstFrameEvent(int32_t extra, const Form
         MEDIA_LOGE("The audio haptic player for normal mode has been released.");
         return;
     }
-    soundNormalImpl->NotifyFirstFrameEvent(latency);
+    soundNormalImpl->NotifyFirstFrameEvent(session_, latency);
 }
 
 void AHSoundNormalCallback::HandleEOSEvent(int32_t extra, const Format &infoBody)
@@ -513,7 +755,7 @@ void AHSoundNormalCallback::HandleEOSEvent(int32_t extra, const Format &infoBody
         MEDIA_LOGE("The audio haptic player for normal mode has been released.");
         return;
     }
-    soundNormalImpl->NotifyEndOfStreamEvent(static_cast<bool>(extra));
+    soundNormalImpl->NotifyEndOfStreamEvent(session_, static_cast<bool>(extra));
 }
 
 } // namesapce AudioStandard

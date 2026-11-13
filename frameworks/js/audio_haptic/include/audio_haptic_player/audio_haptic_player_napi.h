@@ -106,7 +106,8 @@ struct AudioHapticPlayerAsyncContext {
     napi_env env;
     napi_async_work work;
     napi_deferred deferred;
-    bool status;
+    // Preserve the native MSERR_* value; zero alone means success.
+    int32_t status = MSERR_OK;
     AudioHapticPlayerNapi *objectInfo;
 };
 } // namespace Media
